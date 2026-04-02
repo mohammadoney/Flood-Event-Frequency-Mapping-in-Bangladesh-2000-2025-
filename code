@@ -1,0 +1,180 @@
+import os
+import geopandas as gpd
+import matplotlib.colors as mcolors
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import shapely.wkb
+from scipy.sparse import coo_matrix
+from scipy.sparse.csgraph import connected_components
+from shapely import STRtree
+data_folder = 'data'
+output_folder = 'output'
+
+if not os.path.exists(data_folder):
+    os.mkdir(data_folder)
+if not os.path.exists(output_folder):
+    os.mkdir(output_folder)
+def download(url):
+    filename = os.path.join(data_folder, os.path.basename(url).split('?')[0])
+    if not os.path.exists(filename):
+        from urllib.request import urlretrieve
+        local, _ = urlretrieve(url, filename)
+        print('Downloaded ' + local)
+    return filename
+
+shapefile = 'ne_10m_admin_0_countries_ind.zip'
+shapefile_url = f'https://naciscdn.org/naturalearth/10m/cultural/{shapefile}'
+
+parquet_file = 'groundsource_2026.parquet'
+parquet_url = f'https://zenodo.org/records/18647054/files/{parquet_file}?download=1'
+
+download(shapefile_url)
+download(parquet_url)
+shapefile_path = os.path.join(data_folder, shapefile)
+gdf = gpd.read_file(shapefile_path, encoding='utf-8')
+
+# Change 'IND' to 'BGD' for Bangladesh
+country = gdf[gdf['SOV_A3'] == 'BGD']
+
+country.iloc[:, :5]
+
+grid_size = 2000  # 2 km
+grid_crs = 'EPSG:9678' # Bangladesh Transverse Mercator
+from shapely.geometry import box
+
+cell_size = grid_size
+
+country_proj = country.to_crs(grid_crs)
+minx, miny, maxx, maxy = country_proj.total_bounds
+
+xs = np.arange(minx, maxx, cell_size)
+ys = np.arange(miny, maxy, cell_size)
+
+polygons = [
+    box(x, y, x + cell_size, y + cell_size)
+    for x in xs
+    for y in ys
+]
+
+grid = gpd.GeoDataFrame({'geometry': polygons}, crs=grid_crs)
+
+# Keep only cells that intersect the country — faster than clip as it avoids
+# computing exact geometric intersections along the boundary
+grid_country = gpd.sjoin(grid, country_proj[['geometry']],
+                         how='inner', predicate='intersects')
+grid_country = grid_country.drop(columns=['index_right']).reset_index(drop=True)
+print(f'Cells intersecting the country: {len(grid_country):,}')
+fig, ax = plt.subplots(1, 1, figsize=(8, 10))
+grid_country.plot(ax=ax, facecolor='none', edgecolor='steelblue',
+                  linewidth=0.1, alpha=0.8)
+country_proj.plot(ax=ax, facecolor='none', edgecolor='black',
+                  linewidth=0.8)
+ax.set_title('Grid Overlay on Country', fontsize=13)
+ax.axis('off')
+plt.tight_layout()
+plt.show()
+parquet_file_path = os.path.join(data_folder, parquet_file)
+gdf = gpd.read_parquet(parquet_file_path)
+gdf.head()
+geometry = country.geometry.union_all()
+xmin, ymin, xmax, ymax = geometry.bounds
+gdf_filtered= gdf.cx[xmin:xmax, ymin:ymax]
+print('Total records within the country bounding box:', len(gdf_filtered))
+
+# This step is computationally intensive and takes a few minutes.
+
+# Work on a clean positional index
+gdf_flood = gdf_filtered.reset_index(drop=True)
+dates = pd.to_datetime(gdf_flood['start_date']).values
+ndays = 7
+
+# Use spatial index to find candidate pairs
+tree = STRtree(gdf_flood.geometry.values)
+left_idx, right_idx = tree.query(gdf_flood.geometry.values, predicate='intersects')
+
+# Filter out self-intersections and redundant pairs (a,b vs b,a)
+mask = left_idx < right_idx
+left_idx = left_idx[mask]
+right_idx = right_idx[mask]
+
+# Compute date differences using NumPy to avoid creating a large DataFrame
+# If you run out of memory at this step, you can do this in chunks
+date_diff_days = np.abs(
+    (dates[left_idx] - dates[right_idx]).astype('timedelta64[D]').astype(int)
+)
+
+# Filter indices based on the date threshold
+time_mask = date_diff_days <= ndays
+nearby_left = left_idx[time_mask]
+nearby_right = right_idx[time_mask]
+
+# Now create a 'nearby' dataframe only for valid pairs
+nearby = pd.DataFrame({
+    'idx_a': nearby_left,
+    'idx_b': nearby_right
+})
+
+# Now use connected_components to assign a shared `flood_event` id to groups
+# of intersecting temporally-close polygons
+n = len(gdf_flood)
+
+# Build a symmetric sparse adjacency matrix from the nearby pairs
+row = np.concatenate([nearby['idx_a'].values, nearby['idx_b'].values])
+col = np.concatenate([nearby['idx_b'].values, nearby['idx_a'].values])
+graph = coo_matrix((np.ones(len(row), dtype=np.int8), (row, col)), shape=(n, n))
+
+n_components, labels = connected_components(graph, directed=False)
+
+print(f'Total polygons:           {n:>10,}')
+print(f'Unique flood events:      {n_components:>10,}')
+print(f'Avg polygons per event:   {n / n_components:>10.2f}')
+
+gdf_flood['flood_event'] = labels
+gdf_flood[['uuid', 'start_date', 'end_date', 'flood_event']]
+gf_reprojected = gdf_flood.to_crs(grid_crs)
+joined = gpd.sjoin(grid_country, gf_reprojected,
+                   how='inner', predicate='intersects')
+counts = joined.groupby(joined.index)['flood_event'].nunique().rename('flood_count')
+
+grid_country['flood_count'] = grid_country.index.map(counts).fillna(0).astype(int)
+grid_country.head()
+from matplotlib.cm import ScalarMappable
+from matplotlib.patches import Patch
+
+fig, ax = plt.subplots(figsize=(8, 10))
+
+# Cells with no observations in neutral grey
+grid_country[grid_country['flood_count'] == 0].plot(
+    ax=ax, color='#d9d9d9', linewidth=0
+)
+
+# Cells with observations coloured by flood count
+# Using simple linear scale from 1 to 100
+cmap = 'YlOrRd'
+
+non_zero = grid_country[grid_country['flood_count'] > 0]
+non_zero.plot(
+    ax=ax, column='flood_count',
+    cmap=cmap, vmin=1, vmax=100, linewidth=0
+)
+
+# Add Colorbar (Legend for flood counts)
+sm = ScalarMappable(cmap=cmap, norm=plt.Normalize(vmin=1, vmax=100))
+cbar = fig.colorbar(sm, ax=ax, shrink=0.5, pad=0.02)
+cbar.set_label('Number of Unique Flood Events', fontsize=10)
+
+# Add manual legend for the 'No Data' category
+legend_elements = [Patch(facecolor='#d9d9d9', label='No Observations')]
+ax.legend(handles=legend_elements, loc='lower right', frameon=True)
+
+# Country boundary
+country_proj.plot(ax=ax, facecolor='none', edgecolor='#333333', linewidth=0.8)
+
+ax.set_title('Flood Frequency Map of Bangladesh (2000–2025)', fontsize=15, pad=12)
+ax.axis('off')
+plt.tight_layout()
+plt.show()
+output_filename = 'flood_frequency_grid.gpkg'
+output_filepath = os.path.join(output_folder, output_filename)
+grid_country.to_file(output_filepath)
